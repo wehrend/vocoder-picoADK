@@ -10,6 +10,7 @@
 #include "biquad.h"
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 
 namespace {
 
@@ -106,7 +107,7 @@ void setup_pot_adc() {
 // zur Kanaladresse aus dem VORHERIGEN Transfer) - für kontinuierliches
 // Polling eines einzelnen Kanals unkritisch.
 float read_adc_channel(uint8_t channel) {
-    uint16_t txWord = (uint16_t)(channel & 0x07) << 12;
+    uint16_t txWord = (uint16_t)(channel & 0x07) << 11;
     uint8_t txBuf[2] = { (uint8_t)(txWord >> 8), (uint8_t)(txWord & 0xFF) };
     uint8_t rxBuf[2] = {0};
 
@@ -191,6 +192,17 @@ int main() {
             // grobe Normalisierung, bei Bedarf Faktor anpassen/messen.
             float scaledEnvelope = envelope * 6.0f;
             if (scaledEnvelope > 1.0f) scaledEnvelope = 1.0f;
+
+            // DEBUG: rohe Werte über USB-Seriell ausgeben, gedrosselt auf
+            // ~10x/Sekunde (alle 4410 Samples bei 44.1kHz), damit die
+            // Konsole nicht flutet. Nach dem Debuggen wieder entfernen/
+            // auskommentieren, printf kostet CPU-Zeit im Sample-Loop.
+            static uint32_t debugCounter = 0;
+            if (++debugCounter >= 4410) {
+                debugCounter = 0;
+                printf("micNorm=%.3f  envelope=%.3f  scaled=%.3f\n",
+                       micNorm, envelope, scaledEnvelope);
+            }
 
             int16_t s = (int16_t)(sineTable[(phase >> 16) & (kTableSize - 1)] * scaledEnvelope);
             samples[2 * i]     = s; // links

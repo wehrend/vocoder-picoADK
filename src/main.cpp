@@ -1,38 +1,37 @@
-// Hello-World für Audio auf dem PicoADK, jetzt erweitert um einen
-// Envelope-Follower: das Poti steuert weiter die Carrier-Frequenz, das
-// Mic-Signal (über Bandpass + Gleichrichter + Tiefpass) steuert jetzt
-// die Lautstärke - das ist im Kern schon 1/16 eines Vocoders.
+// Envelope-Follower-Vocoderstufe (1/16 eines vollen Vocoders), portiert
+// vom PicoADK auf einen GENERISCHEN Raspberry Pi Pico mit externem
+// PCM5100A/PCM5102A-Breakout am I2S-Bus.
+//
+// UNTERSCHIEDE ZUR PICOADK-VERSION:
+// 1. I2S-Pins sind hier frei wählbar (unten via CMake-Defines), da kein
+//    fest verdrahteter interner DAC mehr vorliegt.
+// 2. Kein ADC128S102/SPI mehr für Poti+Mic - der RP2040 hat 3 eigene
+//    ADC-Kanäle (GPIO26-28), zwei davon reichen für Poti + Mic.
+// 3. KEIN XSMT/DEMP-GPIO-Handling mehr nötig - das übernehmen bei den
+//    meisten Billig-Breakouts feste Jumper/Lötbrücken auf dem Modul
+//    selbst (siehe Checkliste unten in main()).
+
+// Envelope-Follower-Logik (Bandpass -> Gleichrichter -> Attack/Release)
+// und Biquad-Koeffizienten sind 1:1 vom PicoADK-Code übernommen - reine
+// DSP-Mathematik, unabhängig von der Hardware-Plattform.
 
 #include "pico/stdlib.h"
 #include "pico/audio_i2s.h"
-#include "hardware/gpio.h"
-#include "hardware/spi.h"
+#include "hardware/adc.h"
 #include "biquad.h"
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 
 namespace {
 
-// Laut DatanoiseTV/PicoADK-Hardware README ("Internal Signals"):
-// GPIO25 = PCM5100A XSMT (Mute/Unmute), GPIO23 = PCM5100A DEMP.
-// XSMT muss von der Software auf High gesetzt werden, sonst bleibt
-// der DAC-Ausgang stumm geschaltet - das ist NICHT der Default-Zustand!
-constexpr uint XSMT_PIN = 25;
-constexpr uint DEMP_PIN = 23;
-
-// Onboard-ADC128S102 (8-Kanal, 12-Bit, bis 1 MS/s) an SPI1.
-constexpr uint ADC_SCK_PIN  = 10;
-constexpr uint ADC_MOSI_PIN = 11;
-constexpr uint ADC_MISO_PIN = 12;
-constexpr uint ADC_CS_PIN   = 13;
-#define ADC_SPI_PORT spi1
-
-// Kanal 0 = Frequenz-Poti (wie im vorigen Schritt), Kanal 1 = Mic-Amp
-// (MAX9814 oder MAX4466), Ausgang direkt an den ADC-Kanal - beide
-// Module liefern schon einen ADC-tauglichen Bias, kein externes
-// Bias-Netzwerk nötig.
+// RP2040-ADC-Kanäle: ADC0=GPIO26, ADC1=GPIO27, ADC2=GPIO28.
+// Poti-Schleifer -> GPIO26 (Außenbeine -> 3V3/GND).
+// Mic-Amp-Ausgang (MAX9814 oder MAX4466) -> GPIO27 - beide Module
+// liefern schon einen ADC-tauglichen Bias, kein externes Bias-Netzwerk
+// nötig.
+constexpr uint POT_ADC_GPIO     = 26;
 constexpr uint8_t POT_ADC_CHANNEL = 0;
+constexpr uint MIC_ADC_GPIO     = 27;
 constexpr uint8_t MIC_ADC_CHANNEL = 1;
 
 // Frequenzbereich, den das Poti abdeckt (linear gemappt)
@@ -82,7 +81,7 @@ audio_buffer_pool_t *setup_audio() {
 
     const audio_format_t *outputFormat = audio_i2s_setup(&audioFormat, &i2sConfig);
     if (!outputFormat) {
-        panic("PCM5100A I2S setup fehlgeschlagen - Pins/Format pruefen");
+        panic("I2S-Setup fehlgeschlagen - Pins/Format pruefen");
     }
 
     audio_i2s_connect(pool);
@@ -90,32 +89,20 @@ audio_buffer_pool_t *setup_audio() {
     return pool;
 }
 
-void setup_pot_adc() {
-    spi_init(ADC_SPI_PORT, 2 * 1000 * 1000); // 2 MHz, ADC128S102 erlaubt bis ~3.2 MHz
-    gpio_set_function(ADC_SCK_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(ADC_MOSI_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(ADC_MISO_PIN, GPIO_FUNC_SPI);
-
-    gpio_init(ADC_CS_PIN);
-    gpio_set_dir(ADC_CS_PIN, GPIO_OUT);
-    gpio_put(ADC_CS_PIN, 1);
+void setup_adc() {
+    adc_init();
+    adc_gpio_init(POT_ADC_GPIO);
+    adc_gpio_init(MIC_ADC_GPIO);
 }
 
-// ADC128S102-Protokoll: 16 SCLK-Zyklen. Sendewort: 3-bit Kanaladresse
-// (MSB-first) in den oberen Bits. Empfangswort: 4 führende Nullen,
-// dann 12-bit Ergebnis. Pipeline-Delay von 1 Zyklus (Ergebnis gehört
-// zur Kanaladresse aus dem VORHERIGEN Transfer) - für kontinuierliches
-// Polling eines einzelnen Kanals unkritisch.
-float read_adc_channel(uint8_t channel) {
-    uint16_t txWord = (uint16_t)(channel & 0x07) << 11;
-    uint8_t txBuf[2] = { (uint8_t)(txWord >> 8), (uint8_t)(txWord & 0xFF) };
-    uint8_t rxBuf[2] = {0};
-
-    gpio_put(ADC_CS_PIN, 0);
-    spi_write_read_blocking(ADC_SPI_PORT, txBuf, rxBuf, 2);
-    gpio_put(ADC_CS_PIN, 1);
-
-    uint16_t raw = (((uint16_t)rxBuf[0] << 8) | rxBuf[1]) & 0x0FFF;
+// Nativer RP2040-ADC: 12-bit, 0..4095. Deutlich simpler als das
+// ADC128S102-SPI-Protokoll vom PicoADK - kein Kommando-Framing, kein
+// Pipeline-Delay. WICHTIG: adc_select_input() nur beim tatsächlichen
+// Kanalwechsel aufrufen, nicht vor jedem einzelnen Read - der Mic-Kanal
+// bleibt über den gesamten Sample-Loop eines Puffers aktiv ausgewählt,
+// nur einmal pro Puffer wird kurz auf den Poti-Kanal gewechselt.
+float read_adc_normalized() {
+    uint16_t raw = adc_read();
     return (float)raw / 4095.0f;
 }
 
@@ -146,20 +133,24 @@ struct EnvelopeFollower {
 
 int main() {
     stdio_init_all();
+
     build_sine_table();
 
-    // DAC unmuten (XSMT=high) und Deemphase aus (DEMP=low), bevor der
-    // I2S-Stream startet - sonst bleibt der Ausgang stumm.
-    gpio_init(XSMT_PIN);
-    gpio_set_dir(XSMT_PIN, GPIO_OUT);
-    gpio_put(XSMT_PIN, 1);
-
-    gpio_init(DEMP_PIN);
-    gpio_set_dir(DEMP_PIN, GPIO_OUT);
-    gpio_put(DEMP_PIN, 0);
+    // WICHTIG, unbedingt vor dem ersten Test prüfen:
+    // Anders als beim PicoADK (wo XSMT/DEMP per Software-GPIO gesteuert
+    // werden mussten) haben die meisten generischen PCM5102A-Breakout-
+    // Module dafür feste Jumper/Lötbrücken AUF DEM MODUL SELBST:
+    //   XSMT  -> auf HIGH/"un-mute" stellen
+    //   FMT   -> auf LOW/"I2S" stellen (nicht Left-Justified)
+    //   DEMP  -> auf LOW/"off" stellen
+    //   FLT   -> auf LOW/"normal latency" stellen
+    //   SCK   -> auf LOW/"kein externer Master-Clock" stellen
+    // Falls dein Modul diese Signale stattdessen als GPIO-Pins herausführt,
+    // müsstest du sie wie beim PicoADK-Code per gpio_init/gpio_put selbst
+    // auf die obigen Pegel legen.
 
     audio_buffer_pool_t *pool = setup_audio();
-    setup_pot_adc();
+    setup_adc();
 
     EnvelopeFollower envFollower;
     envFollower.init(kEnvelopeBandHz, kEnvelopeQ, /*attackMs=*/5.0f, /*releaseMs=*/120.0f, (float)kSampleRateHz);
@@ -170,12 +161,15 @@ int main() {
 
     while (true) {
         // Poti (Frequenz) einmal pro Puffer lesen reicht - ändert sich
-        // langsam. Die Frequenz-Phaseninkrement wird pro Puffer neu
-        // berechnet, gilt dann für alle Samples darin.
-        float potNorm = read_adc_channel(POT_ADC_CHANNEL);
+        // langsam. Kurzer Kanalwechsel, dann sofort zurück auf Mic für
+        // den Sample-Loop.
+        adc_select_input(POT_ADC_CHANNEL);
+        float potNorm = read_adc_normalized();
         float targetHz = kMinToneHz + potNorm * (kMaxToneHz - kMinToneHz);
         smoothedToneHz += (targetHz - smoothedToneHz) * 0.2f;
         uint32_t phaseInc = (uint32_t)((smoothedToneHz * kTableSize / (float)kSampleRateHz) * 65536.0f);
+
+        adc_select_input(MIC_ADC_CHANNEL);
 
         audio_buffer_t *buf = take_audio_buffer(pool, true);
         int16_t *samples = (int16_t *)buf->buffer->bytes;
@@ -185,24 +179,13 @@ int main() {
             // SAMPLE laufen, nicht einmal pro Puffer - sonst filtert
             // der Bandpass nur 1 von 256 Samples und die "Hüllkurve"
             // wird bedeutungslos (massives Unter-Abtasten).
-            float micNorm = read_adc_channel(MIC_ADC_CHANNEL); // 0..1, Bias inklusive
-            float micBipolar = (micNorm - 0.5f) * 2.0f;        // Bandpass entfernt den Rest-Bias
+            float micNorm = read_adc_normalized(); // 0..1, Bias inklusive
+            float micBipolar = (micNorm - 0.5f) * 2.0f; // Bandpass entfernt den Rest-Bias
             float envelope = envFollower.process(micBipolar);
             // Hüllkurve ist roh oft sehr leise/laut je nach Mic-Gain -
             // grobe Normalisierung, bei Bedarf Faktor anpassen/messen.
             float scaledEnvelope = envelope * 6.0f;
             if (scaledEnvelope > 1.0f) scaledEnvelope = 1.0f;
-
-            // DEBUG: rohe Werte über USB-Seriell ausgeben, gedrosselt auf
-            // ~10x/Sekunde (alle 4410 Samples bei 44.1kHz), damit die
-            // Konsole nicht flutet. Nach dem Debuggen wieder entfernen/
-            // auskommentieren, printf kostet CPU-Zeit im Sample-Loop.
-            static uint32_t debugCounter = 0;
-            if (++debugCounter >= 4410) {
-                debugCounter = 0;
-                printf("micNorm=%.3f  envelope=%.3f  scaled=%.3f\n",
-                       micNorm, envelope, scaledEnvelope);
-            }
 
             int16_t s = (int16_t)(sineTable[(phase >> 16) & (kTableSize - 1)] * scaledEnvelope);
             samples[2 * i]     = s; // links

@@ -16,32 +16,33 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 include(pico_sdk_import.cmake)
 include(pico_extras_import.cmake)
 
-project(i2s_sine_hello C CXX ASM)
+project(vocoder_envelope_step C CXX ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-add_executable(i2s_sine_hello
+add_executable(vocoder_envelope_step
     src/main.cpp
 )
 
-# Fest verdrahtete PCM5100A-I2S-Pins laut DatanoiseTV/PicoADK-Hardware
-# README ("Internal Signals"): GPIO16=DAT, GPIO17=BCLK, GPIO18=LRCLK.
-# Diese Pins sind NICHT am Header herausgeführt, sondern intern fest verdrahtet.
-target_compile_definitions(i2s_sine_hello PRIVATE
-    PICO_AUDIO_I2S_DATA_PIN=16
-    PICO_AUDIO_I2S_CLOCK_PIN_BASE=17
+# Generischer Pico + externes PCM5100A/PCM5102A-Breakout: I2S-Pins sind
+# frei wählbar - an deine tatsächliche Verkabelung anpassen.
+# Empfehlung (wie im i2s-sine-hello-pico-Projekt): GPIO18=DIN, GPIO16=BCK,
+# GPIO17=LRCK (BCK/LRCK müssen aufeinanderfolgende GPIO-Nummern sein).
+target_compile_definitions(vocoder_envelope_step PRIVATE
+    PICO_AUDIO_I2S_DATA_PIN=18
+    PICO_AUDIO_I2S_CLOCK_PIN_BASE=16
 )
 
-target_link_libraries(i2s_sine_hello PRIVATE
+target_link_libraries(vocoder_envelope_step PRIVATE
     pico_stdlib
     pico_audio_i2s
-    hardware_spi
+    hardware_adc
 )
 
-pico_enable_stdio_usb(i2s_sine_hello 1)
-pico_enable_stdio_uart(i2s_sine_hello 0)
+pico_enable_stdio_usb(vocoder_envelope_step 1)
+pico_enable_stdio_uart(vocoder_envelope_step 0)
 
-pico_add_extra_outputs(i2s_sine_hello)
+pico_add_extra_outputs(vocoder_envelope_step)

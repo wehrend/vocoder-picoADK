@@ -71,3 +71,5 @@
 #define INCLUDE_eTaskGetState                   1
 
 #define configASSERT(x) if((x)==0) { portDISABLE_INTERRUPTS(); for(;;); }
+#define configSUPPORT_PICO_SYNC_INTEROP 0
+#define configSUPPORT_PICO_TIME_INTEROP 0

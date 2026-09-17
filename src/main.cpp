@@ -232,6 +232,14 @@ void audioTask(void *) {
 
 } // namespace
 
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+    panic("Stack-Overflow in Task: %s", pcTaskName);
+}
+
+extern "C" void vApplicationMallocFailedHook(void) {
+    panic("FreeRTOS malloc fehlgeschlagen - configTOTAL_HEAP_SIZE in FreeRTOSConfig.h zu klein?");
+}
+
 int main() {
     stdio_init_all();
 

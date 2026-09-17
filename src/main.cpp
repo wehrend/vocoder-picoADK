@@ -51,11 +51,13 @@
 
 #include "pico/stdlib.h"
 #include "pico/audio_i2s.h"
+#include "pico/time.h"
 #include "hardware/adc.h"
 #include "biquad.h"
 #include "vocoder_band.h"
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 
 namespace {
 
@@ -200,11 +202,36 @@ void audioTask(void *) {
         audio_buffer_t *buf = take_audio_buffer(pool, true);
         int16_t *samples = (int16_t *)buf->buffer->bytes;
 
+        // --- DIAGNOSE: bei Stottern hier ansetzen, danach wieder entfernen ---
+        // Vergleicht die tatsächliche Verarbeitungszeit pro Puffer mit dem
+        // dafür verfügbaren Zeitbudget (256 Samples bei 44.1kHz = 5805us).
+        // Zwei mögliche Ergebnisse:
+        //   - avgUs/maxUs liegen NAHE oder ÜBER kBufferBudgetUs
+        //     -> CPU-Budget ist tatsächlich das Problem (siehe README)
+        //   - avgUs/maxUs liegen KOMFORTABEL darunter
+        //     -> das Stottern kommt von woanders (z.B. I2S-IRQ wird durch
+        //        FreeRTOS-kritische-Abschnitte verzögert), CPU ist nicht
+        //        der Flaschenhals
+        constexpr uint32_t kBufferBudgetUs = (kBufferSamples * 1000000ull) / kSampleRateHz;
+        static uint32_t sBufferCount = 0;
+        static uint64_t sSumUs = 0;
+        static uint32_t sMaxUs = 0;
+        // Feinere Aufteilung: wie viel von der Zeit geht in adc_read()
+        // vs. in die 24 Biquad-Aufrufe (Analyse+Synthese)? Klärt, ob die
+        // ADC-Konversion selbst der Flaschenhals ist (siehe Diagnose-
+        // Ausgabe: "adc=" vs "bands=").
+        static uint64_t sAdcUs = 0;
+        static uint64_t sBandsUs = 0;
+        uint64_t loopStartUs = time_us_64();
+        // --- Ende Diagnose-Setup ---
+
         for (uint32_t i = 0; i < buf->max_sample_count; ++i) {
             // WICHTIG (wie schon bei der 1-Band-Stufe): Mic-Read +
             // Analyse/Synthese müssen PRO SAMPLE laufen, nicht einmal pro
             // Puffer - sonst filtern die Bandpässe nur 1 von 256 Samples.
+            uint64_t tAdcStart = time_us_64();
             float micNorm = read_adc_normalized();
+            uint64_t tAdcEnd = time_us_64();
             float micBipolar = (micNorm - 0.5f) * 2.0f;
 
             int16_t carrierRaw = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
@@ -218,6 +245,10 @@ void audioTask(void *) {
             mixed *= kMakeupGain / (float)kNumBands;
             if (mixed > 1.0f) mixed = 1.0f;
             if (mixed < -1.0f) mixed = -1.0f;
+            uint64_t tBandsEnd = time_us_64();
+
+            sAdcUs += (tAdcEnd - tAdcStart);
+            sBandsUs += (tBandsEnd - tAdcEnd);
 
             int16_t s = (int16_t)(mixed * 16000.0f);
             samples[2 * i]     = s; // links
@@ -227,11 +258,42 @@ void audioTask(void *) {
 
         buf->sample_count = buf->max_sample_count;
         give_audio_buffer(pool, buf);
+
+        // --- DIAGNOSE (Fortsetzung von oben) ---
+        uint32_t elapsedUs = (uint32_t)(time_us_64() - loopStartUs);
+        sSumUs += elapsedUs;
+        if (elapsedUs > sMaxUs) sMaxUs = elapsedUs;
+        if (++sBufferCount >= 100) {
+            // __DATE__/__TIME__ werden vom Compiler bei JEDEM Build neu
+            // eingesetzt (Zeitpunkt der Kompilierung dieser Datei) - so
+            // lässt sich zweifelsfrei prüfen, ob das Board wirklich die
+            // zuletzt gebaute Firmware fährt, ganz ohne picotool/USB.
+            printf("Diagnose[%s %s]: avg=%luus max=%luus budget=%luus adc=%luus bands=%luus (100 Puffer)\n",
+                   __DATE__, __TIME__,
+                   (unsigned long)(sSumUs / sBufferCount), (unsigned long)sMaxUs,
+                   (unsigned long)kBufferBudgetUs,
+                   (unsigned long)(sAdcUs / sBufferCount), (unsigned long)(sBandsUs / sBufferCount));
+            sBufferCount = 0;
+            sSumUs = 0;
+            sMaxUs = 0;
+            sAdcUs = 0;
+            sBandsUs = 0;
+        }
+        // --- Ende Diagnose ---
     }
 }
 
 } // namespace
 
+// FreeRTOS ruft diese beiden Hooks aus dem Kernel heraus auf (tasks.c
+// bzw. heap_4.c), erwartet aber, dass die Anwendung sie bereitstellt -
+// aktiviert über configCHECK_FOR_STACK_OVERFLOW=2 und
+// configUSE_MALLOC_FAILED_HOOK=1 in FreeRTOSConfig.h. Ohne diese beiden
+// Funktionen bricht der Link mit "undefined reference" ab.
+// extern "C", weil sie aus reinem C-Code (tasks.c/heap_4.c) aufgerufen
+// werden - ohne extern "C" würde der C++-Compiler den Funktionsnamen
+// mit anderer Signatur "mangeln" und der Linker fände sie trotz
+// vorhandener Definition nicht.
 extern "C" void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
     panic("Stack-Overflow in Task: %s", pcTaskName);
 }

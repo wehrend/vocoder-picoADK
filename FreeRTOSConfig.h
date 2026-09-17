@@ -70,4 +70,4 @@
 #define INCLUDE_xTaskGetCurrentTaskHandle       1
 #define INCLUDE_eTaskGetState                   1
 
-#define configASSERT(x) if((x)==0) { taskDISABLE_INTERRUPTS(); for(;;); }
+#define configASSERT(x) if((x)==0) { portDISABLE_INTERRUPTS(); for(;;); }

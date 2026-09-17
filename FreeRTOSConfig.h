@@ -60,6 +60,17 @@
 #define configTIMER_QUEUE_LENGTH                10
 #define configTIMER_TASK_STACK_DEPTH            configMINIMAL_STACK_SIZE
 
+// Interop-Schicht aus, mit der man rohe pico_sync-Primitiven (mutex_t/
+// semaphore_t aus dem Pico-SDK selbst) blockierend in FreeRTOS-Tasks
+// nutzen könnte - wir verwenden ausschließlich FreeRTOS-eigene
+// Primitiven (Queues), brauchen das also nicht. Wichtiger Nebeneffekt:
+// umgeht einen Compile-Fehler im RP2040-Port (portable/ThirdParty/GCC/
+// RP2040/port.c), wo dieser Codepfad event_groups.h nutzt, ohne vorher
+// timers.h einzubinden ("implicit declaration of
+// xEventGroupSetBitsFromISR/xTimerPendFunctionCallFromISR").
+#define configSUPPORT_PICO_SYNC_INTEROP         0
+#define configSUPPORT_PICO_TIME_INTEROP         0
+
 #define INCLUDE_vTaskPrioritySet                1
 #define INCLUDE_uxTaskPriorityGet               1
 #define INCLUDE_vTaskDelete                     1
@@ -70,6 +81,10 @@
 #define INCLUDE_xTaskGetCurrentTaskHandle       1
 #define INCLUDE_eTaskGetState                   1
 
+// portDISABLE_INTERRUPTS() statt taskDISABLE_INTERRUPTS(): letzteres ist
+// ein Macro aus task.h, das configASSERT() an dieser Stelle noch nicht
+// kennt - portmacro.h (RP2040-SMP-Port) nutzt configASSERT bereits
+// intern (z.B. in vPortRecursiveLock), BEVOR task.h überhaupt included
+// ist. portDISABLE_INTERRUPTS() ist direkt im Port definiert und daher
+// unabhängig von der Include-Reihenfolge in main.cpp verfügbar.
 #define configASSERT(x) if((x)==0) { portDISABLE_INTERRUPTS(); for(;;); }
-#define configSUPPORT_PICO_SYNC_INTEROP 0
-#define configSUPPORT_PICO_TIME_INTEROP 0

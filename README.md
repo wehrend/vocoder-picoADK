@@ -133,9 +133,9 @@ senkt gleichzeitig den ohnehin oft zu hohen Line-Pegel für Kopfhörer.
 - [FreeRTOS-Kernel](https://github.com/FreeRTOS/FreeRTOS-Kernel) (RP2040-Port, `portable/ThirdParty/GCC/RP2040`)
 
 ```bash
-export PICO_SDK_PATH=~/development/frontend_masterclass/abschlussprojekt/hardware/pico-sdk
-export PICO_SDK_PATH=~/development/frontend_masterclass/abschlussprojekt/hardware/pico-sdk
-export FREERTOS_KERNEL_PATH=~/development/frontend_masterclass/abschlussprojekt/hardware/FreeRTOS-Kernel
+export PICO_SDK_PATH=/pfad/zu/pico-sdk
+export PICO_EXTRAS_PATH=/pfad/zu/pico-extras
+export FREERTOS_KERNEL_PATH=/pfad/zu/FreeRTOS-Kernel
 cp $PICO_EXTRAS_PATH/external/pico_extras_import.cmake .
 cp $FREERTOS_KERNEL_PATH/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake .
 ```

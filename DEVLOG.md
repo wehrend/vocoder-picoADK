@@ -192,3 +192,70 @@ Analysegrenze von 8kHz.
 Bauen, flashen, hören - und dieses Nachtrag-Kapitel um die tatsächlich
 gemessenen/gehörten Ergebnisse ergänzen (wie bei den vorigen
 Schritten).
+
+---
+
+# DEVLOG-Nachtrag 2: CPU-Budget-Messung + Umstieg auf Fixed-Point
+
+**Ergebnis der Hardware-Messung (siehe eingebaute Diagnose in
+main.cpp):** Bei float-Arithmetik brauchte die 12-Band-Verarbeitung
+~195.5µs/Sample, verfügbar sind bei 44.1kHz nur ~22.7µs/Sample -
+**Faktor ~8.6x zu langsam**, deutlich schlimmer als die erste grobe
+Schätzung (~1.5-2x). Der ADC-Read selbst war mit ~3.7µs/Sample
+unauffällig - die Bandverarbeitung war der Flaschenhals, nicht die
+Peripherie.
+
+## Wichtige Erkenntnis unterwegs: `-O3` half NICHTS gegenüber `-O0`
+
+Vor der eigentlichen Fixed-Point-Umstellung gab es eine längere
+Sackgasse: die Messwerte blieben mit `-O0` UND mit bestätigtem `-O3`
+exakt identisch (~51.15ms/Puffer, auf die Mikrosekunde). Das sah erst
+nach einem Build-Problem aus (falscher/alter Build im `build`-Ordner),
+war es aber nicht - mehrfach verifiziert (Build-Zeitstempel direkt in
+die Diagnose-Ausgabe eingebaut, `strings *.elf | grep` auf den
+Diagnose-String).
+
+Die eigentliche Erklärung: Auf einem Chip ohne FPU wird JEDE
+float-Operation zu einem Aufruf einer fertigen
+Software-Bibliotheksroutine (`__aeabi_fmul`, `__aeabi_fadd`, ...).
+Diese Routinen selbst werden durch Compiler-Optimierung nicht
+schneller - sie sind vorkompilierte Bibliotheksfunktionen, keine
+Inline-Instruktionen. `-O3` optimiert nur den Code UM diese Aufrufe
+herum (Registerhaltung, Inlining eigener Funktionen, Wegfall von
+Redundanz) - wenn aber praktisch die gesamte Zeit in den
+float-Operationen selbst steckt (wie hier), bleibt für `-O3` kaum
+etwas zu tun übrig. **Lehre für später: bei Softfloat-dominiertem Code
+ist "Build-Typ prüfen" ein sinnvoller erster Check, aber wenn -O0 und
+-O3 identisch sind, ist das selbst schon ein Hinweis auf Softfloat als
+Ursache, nicht auf einen Build-Fehler.**
+
+## Fix: Q16.16 Fixed-Point statt float im Sample-Hot-Path
+
+Neue Dateien `fixed_point.h`, `biquad_fixed.h`, `vocoder_band_fixed.h`
+- Q16.16 (32-Bit signed, 16 Integer-/16 Nachkommabits) statt float für
+alles, was pro Sample läuft (Biquad-Verarbeitung, Gleichrichtung,
+Attack/Release, Mic-Read, Carrier-Wavetable, Ausgangs-Skalierung).
+Ganzzahl-Multiplikation ist auf dem M0+ (Hardware-MUL, 1 Takt für die
+unteren 32 Bit) um ein Vielfaches billiger als eine
+IEEE754-Software-Multiplikation.
+
+Float bleibt bewusst dort, wo es nicht im Hot Path liegt: die
+trigonometrischen Berechnungen in `setBandpass()` (`sinf`/`cosf`) und
+die Attack/Release-Koeffizienten (`expf`) laufen weiterhin in float,
+weil sie nur einmalig beim Start pro Band berechnet werden - dort
+zählt Lesbarkeit/Genauigkeit mehr als Geschwindigkeit.
+
+Die alten float-Header (`biquad.h`, `vocoder_band.h`) bleiben
+unverändert im Projekt liegen, werden aber von `main.cpp` nicht mehr
+eingebunden - als Referenz/Baseline für genau die Messung oben.
+
+## Nächster Schritt
+
+Auf Hardware bauen/flashen und die Diagnose-Ausgabe erneut prüfen.
+Erwartung: `bands=`-Wert sollte deutlich unter die vorherigen ~195µs/
+Sample fallen - ob genug für die 22.7µs-Budgetgrenze, zeigt erst die
+Messung. Falls es reicht: Diagnose-Code wieder entfernen (war immer
+nur als Werkzeug gedacht) und mit echtem Sprechen vor dem Mic die
+Klangqualität beurteilen (Attack/Release/Q/Makeup-Gain nachjustieren).
+Falls es NICHT reicht: verbleibende Hebel sind Samplerate senken
+(22.05kHz) und/oder die Bänder auf beide RP2040-Kerne aufteilen.

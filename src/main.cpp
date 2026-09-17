@@ -1,9 +1,18 @@
 // 12-Band-Filterbank-Vocoder auf generischem Raspberry Pi Pico +
-// PCM5102A-Breakout, jetzt mit FreeRTOS statt bare-metal while-Schleife.
+// PCM5102A-Breakout, mit FreeRTOS statt bare-metal while-Schleife.
+//
+// RECHENPFAD: Q16.16 Fixed-Point (siehe fixed_point.h/biquad_fixed.h/
+// vocoder_band_fixed.h), NICHT float. Grund: eine erste float-Version
+// war auf dem FPU-losen RP2040 bei 44.1kHz/12 Bändern um Faktor ~8.6x
+// zu langsam - siehe DEVLOG für die Messung samt der Erkenntnis, dass
+// -O3 gegenüber -O0 dabei NICHTS half (Softfloat-Bibliotheksaufrufe
+// werden durch Optimierung nicht schneller). Nur die Filter-Koeffizienten
+// (setBandpass, Attack/Release) werden weiterhin einmalig in float
+// berechnet - das läuft nicht im Sample-Hot-Path.
 //
 // AUFBAU:
 // - Modulator (Stimme, Mic-Amp) -> 12 parallele Analyse-Bandpässe ->
-//   Gleichrichter -> Attack/Release -> 12 Hüllkurven (siehe vocoder_band.h)
+//   Gleichrichter -> Attack/Release -> 12 Hüllkurven (siehe vocoder_band_fixed.h)
 // - Carrier (Sägezahn aus Wavetable, tonhöhengesteuert per Poti) -> 12
 //   parallele Synthese-Bandpässe (gleiche Mittenfrequenzen wie oben) ->
 //   je mit der zugehörigen Hüllkurve skaliert -> aufsummiert -> Ausgang
@@ -53,8 +62,9 @@
 #include "pico/audio_i2s.h"
 #include "pico/time.h"
 #include "hardware/adc.h"
-#include "biquad.h"
-#include "vocoder_band.h"
+#include "fixed_point.h"
+#include "biquad_fixed.h"
+#include "vocoder_band_fixed.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -83,21 +93,28 @@ constexpr float kReleaseMs = 100.0f;
 // (z.B. testweise printf auf die Summe vor der Skalierung).
 constexpr float kMakeupGain = 8.0f;
 
-constexpr uint32_t kSampleRateHz  = 44100;
+// Von 44.1kHz auf 22.05kHz gesenkt - verdoppelt das Zeitbudget pro
+// Sample. Filterbank bleibt gueltig: hoechste Bandfrequenz ist 8kHz,
+// klar unter der neuen Nyquist-Grenze von 11.025kHz. Siehe DEVLOG fuer
+// die Messung, die diesen Schritt noetig gemacht hat (auch nach
+// Fixed-Point-Umstellung + Multiplikations-Reduktion allein reichte es
+// laut Abschaetzung noch nicht ganz).
+constexpr uint32_t kSampleRateHz  = 22050;
 constexpr uint32_t kBufferSamples = 256;
 
-VocoderBand bands[kNumBands];
+VocoderBandFixed bands[kNumBands];
+q16 g_makeupGainQ16 = 0; // wird einmalig in audioTask() gesetzt (float_to_q16 gehoert nicht in den Hot Path)
 
-// Sägezahn-Wavetable für den Carrier (Ersatz für die Sinus-Tabelle der
-// vorigen Stufe). Naiv (nicht band-limited) - siehe Aliasing-Hinweis oben.
+// Sägezahn-Wavetable für den Carrier, jetzt direkt in Q16.16 statt
+// int16 - erspart eine Konversion pro Sample im Hot Path.
 constexpr int kCarrierTableSize = 512;
-int16_t carrierTable[kCarrierTableSize];
+q16 carrierTable[kCarrierTableSize];
 
 void build_carrier_table() {
     for (int i = 0; i < kCarrierTableSize; ++i) {
         float phase = (float)i / (float)kCarrierTableSize; // 0..1
         float saw = 2.0f * phase - 1.0f;                   // -1..1 Rampe
-        carrierTable[i] = (int16_t)(saw * 16000.0f);        // ~-6dBFS Headroom
+        carrierTable[i] = float_to_q16(saw);
     }
 }
 
@@ -146,6 +163,16 @@ float read_adc_normalized() {
     return (float)raw / 4095.0f;
 }
 
+// Wie read_adc_normalized(), aber direkt in Q16.16 statt float - fuer
+// den Mic-Read im Sample-Hot-Path. RP2040-ADC ist 12-Bit (0..4095);
+// (raw-2048)<<5 mappt das naeherungsweise auf -1.0..+1.0 in Q16.16
+// (2048 = Mittelwert des 12-Bit-Bereichs, 32 = 65536/2048), komplett
+// ohne Division oder float - nur Subtraktion + Shift.
+inline q16 read_adc_bipolar_q16() {
+    int32_t raw = (int32_t)adc_read();
+    return (raw - 2048) << 5;
+}
+
 // Queues zur Kommunikation zwischen audioTask (ADC-Besitzer) und
 // controlTask (Glättung/Mapping). Länge 1 + xQueueOverwrite: uns
 // interessiert immer nur der JEWEILS AKTUELLSTE Wert, kein Backlog
@@ -159,8 +186,8 @@ void controlTask(void *) {
     for (;;) {
         float potNorm;
         // Bis zu 50ms auf einen neuen Rohwert warten - kommt normalerweise
-        // laengst vorher (1x pro Audio-Puffer, ca. alle 5.8ms bei 256
-        // Samples/44.1kHz).
+        // laengst vorher (1x pro Audio-Puffer, ca. alle 11.6ms bei 256
+        // Samples/22.05kHz).
         if (xQueueReceive(g_potRawQueue, &potNorm, pdMS_TO_TICKS(50)) == pdTRUE) {
             float targetHz = kMinCarrierHz + potNorm * (kMaxCarrierHz - kMinCarrierHz);
             smoothedHz += (targetHz - smoothedHz) * 0.2f;
@@ -175,8 +202,10 @@ void controlTask(void *) {
 
 void audioTask(void *) {
     build_carrier_table();
-    init_vocoder_bands(bands, kNumBands, kBandFreqLowHz, kBandFreqHighHz,
-                        kBandQ, kAttackMs, kReleaseMs, (float)kSampleRateHz);
+    init_vocoder_bands_fixed(bands, kNumBands, kBandFreqLowHz, kBandFreqHighHz,
+                              kBandQ, kAttackMs, kReleaseMs, (float)kSampleRateHz);
+    // float_to_q16() nur hier beim einmaligen Setup, nicht im Hot Path.
+    g_makeupGainQ16 = float_to_q16(kMakeupGain / (float)kNumBands);
 
     audio_buffer_pool_t *pool = setup_audio();
     setup_adc();
@@ -204,7 +233,7 @@ void audioTask(void *) {
 
         // --- DIAGNOSE: bei Stottern hier ansetzen, danach wieder entfernen ---
         // Vergleicht die tatsächliche Verarbeitungszeit pro Puffer mit dem
-        // dafür verfügbaren Zeitbudget (256 Samples bei 44.1kHz = 5805us).
+        // dafür verfügbaren Zeitbudget (256 Samples bei 22.05kHz = 11610us).
         // Zwei mögliche Ergebnisse:
         //   - avgUs/maxUs liegen NAHE oder ÜBER kBufferBudgetUs
         //     -> CPU-Budget ist tatsächlich das Problem (siehe README)
@@ -230,27 +259,30 @@ void audioTask(void *) {
             // Analyse/Synthese müssen PRO SAMPLE laufen, nicht einmal pro
             // Puffer - sonst filtern die Bandpässe nur 1 von 256 Samples.
             uint64_t tAdcStart = time_us_64();
-            float micNorm = read_adc_normalized();
+            q16 micQ16 = read_adc_bipolar_q16();
             uint64_t tAdcEnd = time_us_64();
-            float micBipolar = (micNorm - 0.5f) * 2.0f;
 
-            int16_t carrierRaw = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
-            float carrierBipolar = (float)carrierRaw / 16000.0f;
+            q16 carrierQ16 = carrierTable[(phase >> 16) & (kCarrierTableSize - 1)];
 
-            float mixed = 0.0f;
+            q16 mixed = 0;
             for (int b = 0; b < kNumBands; ++b) {
-                bands[b].analyze(micBipolar);
-                mixed += bands[b].synthesize(carrierBipolar);
+                bands[b].analyze(micQ16);
+                mixed += bands[b].synthesize(carrierQ16);
             }
-            mixed *= kMakeupGain / (float)kNumBands;
-            if (mixed > 1.0f) mixed = 1.0f;
-            if (mixed < -1.0f) mixed = -1.0f;
+            mixed = q16_mul(mixed, g_makeupGainQ16);
+            if (mixed > kQ16One) mixed = kQ16One;
+            if (mixed < -kQ16One) mixed = -kQ16One;
             uint64_t tBandsEnd = time_us_64();
 
             sAdcUs += (tAdcEnd - tAdcStart);
             sBandsUs += (tBandsEnd - tAdcEnd);
 
-            int16_t s = (int16_t)(mixed * 16000.0f);
+            // Q16.16 (~+-1.0) -> int16 PCM (~+-32767), per Ganzzahl-
+            // Multiplikation+Shift statt float-Division.
+            int32_t s32 = (int32_t)(((int64_t)mixed * 32767) >> kQ16Frac);
+            if (s32 > 32767) s32 = 32767;
+            if (s32 < -32768) s32 = -32768;
+            int16_t s = (int16_t)s32;
             samples[2 * i]     = s; // links
             samples[2 * i + 1] = s; // rechts
             phase += phaseInc;

@@ -14,6 +14,16 @@ cmake_minimum_required(VERSION 3.13)
 
 set(PICO_BOARD pico CACHE STRING "Board type")
 
+# WICHTIG: ohne explizit gesetzten Build-Type kompiliert CMake mit -O0
+# (keine Optimierung). Auf einem FPU-losen Chip mit viel Float-Code wie
+# hier macht das einen Unterschied von Faktor 5-10x - siehe DEVLOG.
+# Als Default absichern, falls -DCMAKE_BUILD_TYPE beim cmake-Aufruf
+# vergessen wird; explizit übergebenes -DCMAKE_BUILD_TYPE=... überschreibt
+# das trotzdem, weil "CACHE ... FORCE" hier bewusst NICHT verwendet wird.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" )
+endif()
+
 # Alle drei Import-Dateien MÜSSEN vor project() eingebunden werden.
 include(pico_sdk_import.cmake)
 include(pico_extras_import.cmake)

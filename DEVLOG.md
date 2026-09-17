@@ -123,3 +123,72 @@ erscheinende `RP2_BOOT`-Laufwerk kopieren.
 Ein Carrier-Oszillator (Sägezahn/Puls) mit Frequenzsteuerung über ein
 Poti am ADC128S102 (SPI1) - isoliert den ADC-Signalpfad, bevor der
 Mic-Preamp für den eigentlichen Vocoder-Modulator dazukommt.
+
+---
+
+# DEVLOG-Nachtrag: 12-Band-Filterbank + FreeRTOS
+
+Ziel: von 1/16-Envelope-Follower (Schritt 3) auf volle 12-Band-
+Filterbank hochskalieren, und dabei von der bare-metal `while`-Schleife
+auf FreeRTOS umsteigen, bevor die Komplexität (12x Analyse + 12x
+Synthese pro Sample) die single-threaded Struktur sprengt.
+
+**Status: Code geschrieben, NOCH NICHT gebaut/geflasht.** Die
+folgenden Punkte sind Design-Entscheidungen mit Begründung, keine auf
+Hardware verifizierten Ergebnisse - das ist der eigentliche nächste
+Schritt.
+
+## Designentscheidung: geteilter ADC zwischen zwei FreeRTOS-Tasks
+
+Naheliegend wäre gewesen, das Poti-Handling einfach in einen eigenen
+Task mit eigenem `adc_select_input()`/`adc_read()` auszulagern. Das
+ist aber gefährlich: Poti und Mic hängen am selben ADC (ein
+Hardware-Mux mit genau einem "aktuell ausgewählter Kanal"-Zustand).
+Zwei Tasks, die unabhängig voneinander den Kanal umschalten, können
+sich gegenseitig mitten im Sample-Loop den Kanal wegreißen - ohne
+Fehlermeldung, nur als kaputtes/falsches Audiosignal sichtbar (schwer
+zu diagnostizieren).
+
+**Lösung:** Nur der `audioTask` fasst den ADC an (Poti 1x pro Puffer,
+Mic pro Sample - wie in Schritt 3). Der rohe Poti-Wert geht per
+`xQueueOverwrite()` (Länge-1-"Mailbox", kein Backlog) an den
+`controlTask`, der glättet/mappt und das Ergebnis über eine zweite
+Länge-1-Queue zurückgibt. `audioTask` liest die mit Timeout 0
+(nicht-blockierend) - falls kein neuer Wert da ist, wird einfach der
+letzte bekannte weiterverwendet, statt die Echtzeitschleife zu
+blockieren.
+
+## Designentscheidung: Sägezahn statt Sinus als Carrier
+
+Schritt 3 hatte einen Sinuston, dessen Lautstärke von der Hüllkurve
+gesteuert wurde. Für einen echten Vocoder reicht das nicht: der
+Carrier muss Energie in allen 12 Analysebändern haben, sonst bleiben
+Bänder mit höherer Mittenfrequenz stumm, egal wie laut gesprochen
+wird. Sägezahn (naive Wavetable, kein Band-Limiting) liefert diese
+Obertöne. Nebenentscheidung: Carrier-Frequenzbereich auf 80-400Hz
+begrenzt (statt 80-1500Hz wie beim alten Sinus) - je höher die
+Grundfrequenz, desto weniger Obertöne liegen unterhalb der oberen
+Analysegrenze von 8kHz.
+
+## Offene Risiken für den Hardware-Test
+
+- **CPU-Budget unklar**: 12 Bänder × 2 Biquads/Sample ist ein
+  Vielfaches der Rechenlast von Schritt 3, auf einem M0+ ohne FPU bei
+  44.1kHz. Falls das nicht rechtzeitig fertig wird: Knacken/Aussetzer
+  zu erwarten. Erste Gegenmaßnahmen bei Bedarf: Sample-Rate senken,
+  Puffer vergrößern, Bandzahl testweise reduzieren um die Grenze zu
+  finden.
+- **FreeRTOSConfig.h ungetestet**: Taktrate/Stackgrößen/Heap sind ein
+  erster plausibler Entwurf, keine verifizierten Werte.
+- Falls `take_audio_buffer(pool, true)` intern busy-waited statt
+  FreeRTOS-freundlich zu blockieren, könnte der niedrigpriore
+  `controlTask` in der Praxis seltener drankommen als die
+  20ms-`vTaskDelay` vermuten lässt - im Zweifel mit einer GPIO-Toggle+
+  Oszi-Messung oder `uxTaskGetStackHighWaterMark` verifizieren, wenn
+  die Poti-Reaktion auf Hardware träge wirkt.
+
+## Nächster Schritt
+
+Bauen, flashen, hören - und dieses Nachtrag-Kapitel um die tatsächlich
+gemessenen/gehörten Ergebnisse ergänzen (wie bei den vorigen
+Schritten).

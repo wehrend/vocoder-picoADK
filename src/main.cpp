@@ -85,9 +85,12 @@ constexpr float kMaxCarrierHz = 400.0f;
 constexpr int kNumBands = 12;
 constexpr float kBandFreqLowHz  = 100.0f;
 constexpr float kBandFreqHighHz = 8000.0f;
-constexpr float kBandQ = 4.0f; // konstantes Q bei log-Staffelung = konstante relative Bandbreite
-constexpr float kAttackMs  = 3.0f;
-constexpr float kReleaseMs = 100.0f;
+constexpr float kBandQ = 2.0f; // von 4.0 gesenkt - schmalere Bänder klingeln länger/reagieren träger, siehe DEVLOG
+// Tiefstes -> höchstes Band: langsam/schmal -> schnell (siehe init_vocoder_bands_fixed)
+constexpr float kAttackMsLow   = 8.0f;
+constexpr float kAttackMsHigh  = 1.5f;
+constexpr float kReleaseMsLow  = 150.0f;
+constexpr float kReleaseMsHigh = 40.0f;
 // Platzhalter wie schon bei der 1-Band-Stufe - hängt von Mic-Gain und
 // Abstand zum Mic ab, auf echter Hardware experimentell nachjustieren
 // (z.B. testweise printf auf die Summe vor der Skalierung).
@@ -203,7 +206,8 @@ void controlTask(void *) {
 void audioTask(void *) {
     build_carrier_table();
     init_vocoder_bands_fixed(bands, kNumBands, kBandFreqLowHz, kBandFreqHighHz,
-                              kBandQ, kAttackMs, kReleaseMs, (float)kSampleRateHz);
+                              kBandQ, kAttackMsLow, kAttackMsHigh,
+                              kReleaseMsLow, kReleaseMsHigh, (float)kSampleRateHz);
     // float_to_q16() nur hier beim einmaligen Setup, nicht im Hot Path.
     g_makeupGainQ16 = float_to_q16(kMakeupGain / (float)kNumBands);
 

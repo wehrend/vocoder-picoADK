@@ -40,11 +40,19 @@ struct VocoderBandFixed {
 
 inline void init_vocoder_bands_fixed(VocoderBandFixed *bands, int numBands,
                                       float freqLowHz, float freqHighHz,
-                                      float q, float attackMs, float releaseMs,
+                                      float q,
+                                      float attackMsLow, float attackMsHigh,
+                                      float releaseMsLow, float releaseMsHigh,
                                       float sampleRate) {
     for (int i = 0; i < numBands; ++i) {
         float t = (numBands == 1) ? 0.0f : (float)i / (float)(numBands - 1);
         float freq = freqLowHz * powf(freqHighHz / freqLowHz, t);
+        // t=0 (tiefstes Band) -> langsame Zeitkonstanten (Formanten
+        // bewegen sich langsam), t=1 (höchstes Band) -> schnelle
+        // Zeitkonstanten (Konsonanten/Transienten brauchen das für
+        // Verständlichkeit) - siehe DEVLOG für die Begründung.
+        float attackMs = attackMsLow + t * (attackMsHigh - attackMsLow);
+        float releaseMs = releaseMsLow + t * (releaseMsHigh - releaseMsLow);
         bands[i].init(freq, q, attackMs, releaseMs, sampleRate);
     }
 }
